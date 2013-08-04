@@ -128,3 +128,11 @@ var main$Main$main = new $(function() {
 
 Which is certainly easier to read and is more efficient, in code space
 and runtime performance. But it still has to be tested.
+
+## Running the JavaScript
+
+If we run the generated JavaScript with node, we get:
+
+    Behold, the number of the beast:
+    666
+    Mwuhahaha.
