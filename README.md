@@ -23,7 +23,7 @@ instance Foo () where foo _ = "Mwuhahaha."
 
 When GHC compiles your code, it desugares, simplifies, and translates
 it to Core, after which it will implement sharing and inlining, among
-other optimmizations. So the above program compiled to Core, is—after
+other optimizations. So the above program compiled to Core, is—after
 stripping out redundant information not necessary for this
 explanation—the following:
 
@@ -113,7 +113,7 @@ Top-level declarations are thunked, and all functions are forced
 before applying them to arguments, with the exception of built-ins
 which are known to be fully normalized and thus don't need forcing.
 
-An experimental optimmization that I'm trying is to replace that
+An experimental optimization that I'm trying is to replace that
 nesting for the IO monad with normal JavaScript sequence expressions:
 
 ```javascript
