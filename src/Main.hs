@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE DeriveDataTypeable #-}
@@ -30,7 +31,6 @@ import           Data.String
 import           Data.Text.Lazy (Text)
 import qualified Data.Text.Lazy as T
 import           Data.Text.Lazy.Builder
-import           Data.Text.Lazy.Builder.Int
 import qualified Data.Text.Lazy.Encoding as T
 import qualified Data.Text.Lazy.IO as T
 import           Data.Time
@@ -60,177 +60,35 @@ import           TyCon
 import           TypeRep
 import           Var
 
--- | JavaScript statement.
-data Statement
-  = Declaration !Identifier !Expression
-  | Return !Expression
-  | Throw !Expression
-  deriving (Eq,Show)
-
--- | JavaScript expression.
-data Expression
-  = Variable !Identifier
-  | New !Identifier !Expression
-  | Sequence [Expression]
-  | Function ![Identifier] !Expression
-  | Procedure ![Identifier] ![Statement]
-  | Apply !Expression ![Expression]
-  | Conditional !Expression !Expression !Expression
-  | StrictEqual !Expression !Expression
-  | Integer !Integer
-  | Double !Double
-  | String !String
-  deriving (Eq,Show)
-
--- | Variable name.
-newtype Identifier
-  = Identifier Text
-  deriving (Eq,Show)
-
--- | State of the JS printer.
-data PrintState
-  = PrintState { psBuilder :: !Builder }
-
--- | JS pretty printer.
-newtype PP a = PP { runPP :: State PrintState a }
-  deriving (Functor,Monad,MonadState PrintState)
-
-write :: Text -> PP ()
-write = build . fromLazyText
-
-build :: Builder -> PP ()
-build x = modify (\(PrintState builder) -> PrintState (builder <> x))
-
--- | Render the JS AST to text.
-renderStatement :: Statement -> Text
-renderStatement = write . pp where
-  pp = flip execState state . runPP . ppStatement
-  write = toLazyText . psBuilder
-  state = PrintState mempty
-
--- | A pretty printer for the JS.
-ppStatement :: Statement -> PP ()
-ppStatement s =
-  case s of
-    Declaration i e -> do write "var "
-                          ppIdentifier i
-                          write " = "
-                          ppExpression e
-                          write ";"
-    Return e -> do write "return ("
-                   ppExpression e
-                   write ");"
-    Throw e -> do write "throw ("
-                  ppExpression e
-                  write ");"
-
--- | Pretty print expressions.
-ppExpression :: Expression -> PP ()
-ppExpression e =
-  case e of
-    Variable i -> ppIdentifier i
-    New i e -> do write "new "
-                  ppIdentifier i
-                  write "("
-                  ppExpression e
-                  write ")"
-    Function is e -> ppProcedure is [Return e]
-    Procedure is ss -> ppProcedure is ss
-    Apply e es -> do ppExpression e
-                     write "("
-                     intercalateM ", " (map ppExpression es)
-                     write ")"
-    Conditional p y n -> do write "("
-                            ppExpression p
-                            write " ? "
-                            ppExpression y
-                            write " : "
-                            ppExpression n
-                            write ")"
-    StrictEqual a b -> do ppExpression a
-                          write " === "
-                          ppExpression b
-    Sequence es -> do write "("
-                      intercalateM ", " (map ppExpression es)
-                      write ")"
-    Integer i -> build (decimal i)
-    Double d -> write (T.pack (show d))
-    String s -> write (T.pack (ECMA.renderExpression (ECMA.StringLit () s)))
-
-ppProcedure :: [Identifier] -> [Statement] -> PP ()
-ppProcedure is ss =
-  do write "function("
-     intercalateM ", " (map ppIdentifier is)
-     write "){"
-     intercalateM ";" (map ppStatement ss)
-     write "}"
-
--- | Pretty print an identifier.
-ppIdentifier :: Identifier -> PP ()
-ppIdentifier i =
-  case i of
-    Identifier text -> write text
-
--- | Intercalate monadic action.
-intercalateM :: Text -> [PP a] -> PP ()
-intercalateM _ [] = return ()
-intercalateM _ [x] = x >> return ()
-intercalateM str (x:xs) = do
-  x
-  write str
-  intercalateM str xs
-
 --------------------------------------------------------------------------------
--- Compiling
+-- Top-level compilers
 
-newtype Compile a = Compile { runCompile :: ReaderT DynFlags IO a }
-  deriving (Monad,Functor,MonadIO,MonadReader DynFlags,Applicative)
+getCore :: FilePath -> IO CoreModule
+getCore = getCoreAst
 
-core :: FilePath -> IO ()
-core fp = do
-  (dynflags,core) <- getCoreAst fp
-  putStrLn $ showppr core
+getJs :: CoreModule -> IO [Statement]
+getJs = runCompile . compileModule
 
-jsStr :: FilePath -> IO (Text,Text)
-jsStr fp = do
-  (dynflags,core) <- getCoreAst fp
-  stmts <- runReaderT (runCompile (compileModule core)) dynflags
-  js <- beautify $ T.concat (map renderStatement stmts)
+getText :: [Statement] -> IO Text
+getText stmts = do
   forejs <- getForeJs
-  let str = forejs <> "\n" <> js <> run
-  T.writeFile "test.js" str
-  return (js,str)
+  js <- beautify $ renderStatements (length (T.lines forejs)) stmts
+  return (forejs <> js <> run)
 
-js fp = do
-  (js,str) <- jsStr fp
-  T.putStrLn js
-
-ast :: FilePath -> IO ()
-ast fp = do
-   (dynflags,core) <- getCoreAst fp
-   stmts <- runReaderT (runCompile (compileModule core)) dynflags
-   print stmts
-
-interp :: FilePath -> IO ()
-interp fp = do
-  (dynflags,core) <- getCoreAst fp
-  stmts <- runReaderT (runCompile $ compileModule core) dynflags
-  js <- beautify $ T.concat (map renderStatement stmts)
-  forejs <- getForeJs
-  let str = forejs <> "\n" <> js <> run
-  interpStr str
-
-interpStr :: Text -> IO ()
-interpStr str = do
-  T.writeFile "/tmp/interp.js" (str)
-  result <- readAllFromProcess "node" ["/tmp/interp.js"] ""
+interp :: Text -> IO ()
+interp input = do
+  -- T.writeFile "/tmp/interp.js" (str)
+  result <- readAllFromProcess "node" [] input
   case result of
     Left err -> error (T.unpack err)
     Right (stderr,stdout) -> do T.putStrLn stderr
                                 T.putStrLn stdout
 
 run :: Text
-run = "var start = new Date();_(main$ZCMain$main,true);var end = new Date();console.log((end-start)+'ms')"
+run = "var start = new Date();" <>
+      "_(main$ZCMain$main,true);" <>
+      "var end = new Date();" <>
+      "console.log((end-start)+'ms')"
 
 getForeJs :: IO Text
 getForeJs = do
@@ -239,10 +97,15 @@ getForeJs = do
   instances <- T.readFile "../js/instances.js"
   io <- T.readFile "../js/io.js"
   primitives <- T.readFile "../js/primitives.js"
-  return (T.concat [rts,classes,instances,io,primitives])
+  let header = T.pack (replicate 80 '/') <> "\n// Application/library code\n"
+  beautify (T.concat [rts,classes,instances,io,primitives,header])
 
 --------------------------------------------------------------------------------
 -- Compilers
+
+-- | The compilation monad.
+newtype Compile a = Compile { runCompile :: IO a }
+  deriving (Monad,Functor,MonadIO,Applicative)
 
 compileModule :: CoreModule -> Compile [Statement]
 compileModule (CoreModule{cm_binds=binds}) =
@@ -575,7 +438,7 @@ isFunction _          = False
 -- Working with Core
 
 -- | Get the core AST of a Haskell file.
-getCoreAst :: FilePath -> IO (DynFlags,CoreModule)
+getCoreAst :: FilePath -> IO CoreModule
 getCoreAst fp = do
   defaultErrorHandler defaultLogAction $ do
     runGhc (Just libdir) $ do
@@ -583,7 +446,7 @@ getCoreAst fp = do
       let dflags' = foldl xopt_set dflags [Opt_Cpp,Opt_ImplicitPrelude,Opt_MagicHash]
       setSessionDynFlags dflags' { optLevel = 2 }
       cm <- compileToCoreSimplified fp
-      return $ (dflags,cm)
+      return cm
 
 --------------------------------------------------------------------------------
 -- Printing
@@ -598,20 +461,9 @@ beautify src = do
     Left err -> error (T.unpack err)
     Right (_,out) -> return out
 
--- | Compress the given JS with Closure.
+-- | Compress the given JS with Closure with advanced compilation.
 compress :: Text -> IO Text
 compress src = do
-  result <- readAllFromProcess "java"
-                               ["-jar"
-                               ,"/home/chris/Projects/fpco/learning-site/tools/closure-compiler.jar"]
-                               src
-  case result of
-    Left err -> error (T.unpack err)
-    Right (_,out) -> return out
-
--- | Compress the given JS with Closure with advanced compilation.
-compressAdv :: Text -> IO Text
-compressAdv src = do
   result <- readAllFromProcess "java"
                                ["-jar"
                                ,"/home/chris/Projects/fpco/learning-site/tools/closure-compiler.jar"
@@ -678,3 +530,148 @@ gtraverseT f =
 -- Show but Outputable instead.
 showppr :: Outputable a => a -> String
 showppr = showSDoc . ppr
+
+--------------------------------------------------------------------------------
+-- AST
+
+-- | JavaScript statement.
+data Statement
+  = Declaration !Identifier !Expression
+  | Return !Expression
+  | Throw !Expression
+  deriving (Eq,Show)
+
+-- | JavaScript expression.
+data Expression
+  = Variable !Identifier
+  | New !Identifier !Expression
+  | Sequence [Expression]
+  | Function ![Identifier] !Expression
+  | Procedure ![Identifier] ![Statement]
+  | Apply !Expression ![Expression]
+  | Conditional !Expression !Expression !Expression
+  | StrictEqual !Expression !Expression
+  | Integer !Integer
+  | Double !Double
+  | String !String
+  deriving (Eq,Show)
+
+-- | Variable name.
+newtype Identifier
+  = Identifier Text
+  deriving (Eq,Show)
+
+-- | State of the JS printer.
+data PrintState
+  = PrintState { psBuilder :: !Builder
+               , psLine    :: !Int
+               , psColumn  :: !Int
+               }
+
+--------------------------------------------------------------------------------
+-- Pretty printer
+
+-- | JS pretty printer.
+newtype PP a = PP { runPP :: State PrintState a }
+  deriving (Functor,Monad,MonadState PrintState)
+
+-- | Write some text to the output builder.
+write :: Text -> PP ()
+write x = do
+  ps <- get
+  let !builder = psBuilder ps <> fromLazyText x
+      !column = psColumn ps + fromIntegral (T.length x)
+  put ps { psBuilder = builder
+         , psColumn = column
+         }
+
+-- | Render the JS AST to text.
+renderStatements :: Int -> [Statement] -> Text
+renderStatements line = write . pp where
+  pp = flip execState state . runPP . ppStatements
+  write = toLazyText . psBuilder
+  state = PrintState mempty line 0
+
+ppStatements :: [Statement] -> PP ()
+ppStatements = mapM_ ppStatement
+
+-- | A pretty printer for the JS.
+ppStatement :: Statement -> PP ()
+ppStatement s =
+  case s of
+    Declaration i e ->
+      do write "var "
+         ppIdentifier i
+         write " = "
+         ppExpression e
+         write ";"
+    Return e ->
+      do write "return ("
+         ppExpression e
+         write ");"
+    Throw e ->
+      do write "throw ("
+         ppExpression e
+         write ");"
+
+-- | Pretty print expressions.
+ppExpression :: Expression -> PP ()
+ppExpression e =
+  case e of
+    Variable i -> ppIdentifier i
+    New i e ->
+      do write "new "
+         ppIdentifier i
+         write "("
+         ppExpression e
+         write ")"
+    Function is e -> ppProcedure is [Return e]
+    Procedure is ss -> ppProcedure is ss
+    Apply e es ->
+      do ppExpression e
+         write "("
+         intercalateM ", " (map ppExpression es)
+         write ")"
+    Conditional p y n ->
+      do write "("
+         ppExpression p
+         write " ? "
+         ppExpression y
+         write " : "
+         ppExpression n
+         write ")"
+    StrictEqual a b ->
+      do ppExpression a
+         write " === "
+         ppExpression b
+    Sequence es ->
+      do write "("
+         intercalateM ", " (map ppExpression es)
+         write ")"
+    Integer i -> write (T.pack (show i))
+    Double d -> write (T.pack (show d))
+    String s -> write (T.pack (ECMA.renderExpression (ECMA.StringLit () s)))
+
+-- | Pretty print a function closure.
+ppProcedure :: [Identifier] -> [Statement] -> PP ()
+ppProcedure is ss =
+  do write "function("
+     intercalateM ", " (map ppIdentifier is)
+     write "){"
+     intercalateM ";" (map ppStatement ss)
+     write "}"
+
+-- | Pretty print an identifier.
+ppIdentifier :: Identifier -> PP ()
+ppIdentifier i =
+  case i of
+    Identifier text -> write text
+
+-- | Intercalate monadic action.
+intercalateM :: Text -> [PP a] -> PP ()
+intercalateM _ [] = return ()
+intercalateM _ [x] = x >> return ()
+intercalateM str (x:xs) = do
+  x
+  write str
+  intercalateM str xs
