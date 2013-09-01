@@ -1,155 +1,313 @@
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE NoMonomorphismRestriction #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+
 -- | Haskell to JavaScript compiler.
 
 module Fore where
 
-import           Control.Monad
+import           Control.Applicative
 import           Control.Exception
+import           Control.Monad
 import           Control.Monad.Identity
 import           Control.Monad.Reader
+import           Control.Monad.State
 import           Control.Monad.Trans
 import           CoreSyn
+import qualified Data.ByteString.Lazy as L
 import           Data.Data hiding (tyConName)
 import           Data.Generics.Aliases
 import           Data.List
 import           Data.Maybe
+import           Data.Monoid
 import           Data.String
+import           Data.Text.Lazy (Text)
+import qualified Data.Text.Lazy as T
+import           Data.Text.Lazy.Builder
+import           Data.Text.Lazy.Builder.Int
+import qualified Data.Text.Lazy.Encoding as T
+import qualified Data.Text.Lazy.IO as T
+import           Data.Time
 import           DataCon
 import           Debug.Trace
 import           DynFlags
 import           Encoding
 import           FastString
 import           GHC
-import           GHC.Paths ( libdir )
+import           GHC.Paths (libdir)
 import           GHC.Real
 import           HscTypes
 import qualified Language.ECMAScript3.Parser as ECMA
 import qualified Language.ECMAScript3.PrettyPrint as ECMA
-import           Language.ECMAScript3.Syntax as ECMA
+import qualified Language.ECMAScript3.Syntax as ECMA
 import           Literal
 import           Module
 import           Name hiding (varName)
 import           OccName hiding (varName)
-import           Outputable
-import           Outputable
+import           Outputable hiding ((<>))
 import           Prelude hiding (exp)
 import           System.Exit
 import           System.IO
-import           System.Process
+import           System.Process.Text.Lazy
 import qualified Text.PrettyPrint as Doc
 import           TyCon
 import           TypeRep
 import           Var
 
+-- | JavaScript statement.
+data Statement
+  = Declaration !Identifier !Expression
+  | Return !Expression
+  | Throw !Expression
+  deriving (Eq,Show)
+
+-- | JavaScript expression.
+data Expression
+  = Variable !Identifier
+  | New !Identifier !Expression
+  | Sequence [Expression]
+  | Function ![Identifier] !Expression
+  | Procedure ![Identifier] ![Statement]
+  | Apply !Expression ![Expression]
+  | Conditional !Expression !Expression !Expression
+  | StrictEqual !Expression !Expression
+  | Integer !Integer
+  | Double !Double
+  | String !String
+  deriving (Eq,Show)
+
+-- | Variable name.
+newtype Identifier
+  = Identifier Text
+  deriving (Eq,Show)
+
+-- | State of the JS printer.
+data PrintState
+  = PrintState { psBuilder :: !Builder }
+
+-- | JS pretty printer.
+newtype PP a = PP { runPP :: State PrintState a }
+  deriving (Functor,Monad,MonadState PrintState)
+
+write :: Text -> PP ()
+write = build . fromLazyText
+
+build :: Builder -> PP ()
+build x = modify (\(PrintState builder) -> PrintState (builder <> x))
+
+-- | Render the JS AST to text.
+renderStatement :: Statement -> Text
+renderStatement = write . pp where
+  pp = flip execState state . runPP . ppStatement
+  write = toLazyText . psBuilder
+  state = PrintState mempty
+
+-- | A pretty printer for the JS.
+ppStatement :: Statement -> PP ()
+ppStatement s =
+  case s of
+    Declaration i e -> do write "var "
+                          ppIdentifier i
+                          write " = "
+                          ppExpression e
+                          write ";"
+    Return e -> do write "return ("
+                   ppExpression e
+                   write ");"
+    Throw e -> do write "throw ("
+                  ppExpression e
+                  write ");"
+
+-- | Pretty print expressions.
+ppExpression :: Expression -> PP ()
+ppExpression e =
+  case e of
+    Variable i -> ppIdentifier i
+    New i e -> do write "new "
+                  ppIdentifier i
+                  write "("
+                  ppExpression e
+                  write ")"
+    Function is e -> ppProcedure is [Return e]
+    Procedure is ss -> ppProcedure is ss
+    Apply e es -> do ppExpression e
+                     write "("
+                     intercalateM ", " (map ppExpression es)
+                     write ")"
+    Conditional p y n -> do write "("
+                            ppExpression p
+                            write " ? "
+                            ppExpression y
+                            write " : "
+                            ppExpression n
+                            write ")"
+    StrictEqual a b -> do ppExpression a
+                          write " === "
+                          ppExpression b
+    Sequence es -> do write "("
+                      intercalateM ", " (map ppExpression es)
+                      write ")"
+    Integer i -> build (decimal i)
+    Double d -> write (T.pack (show d))
+    String s -> write (T.pack (ECMA.renderExpression (ECMA.StringLit () s)))
+
+ppProcedure :: [Identifier] -> [Statement] -> PP ()
+ppProcedure is ss =
+  do write "function("
+     intercalateM ", " (map ppIdentifier is)
+     write "){"
+     intercalateM ";" (map ppStatement ss)
+     write "}"
+
+-- | Pretty print an identifier.
+ppIdentifier :: Identifier -> PP ()
+ppIdentifier i =
+  case i of
+    Identifier text -> write text
+
+-- | Intercalate monadic action.
+intercalateM :: Text -> [PP a] -> PP ()
+intercalateM _ [] = return ()
+intercalateM _ [x] = x >> return ()
+intercalateM str (x:xs) = do
+  x
+  write str
+  intercalateM str xs
+
 --------------------------------------------------------------------------------
 -- Compiling
 
 newtype Compile a = Compile { runCompile :: ReaderT DynFlags IO a }
-  deriving (Monad,Functor,MonadIO,MonadReader DynFlags)
-
-hs :: FilePath -> IO ()
-hs = readFile >=> putStrLn
+  deriving (Monad,Functor,MonadIO,MonadReader DynFlags,Applicative)
 
 core :: FilePath -> IO ()
 core fp = do
   (dynflags,core) <- getCoreAst fp
-  putStrLn $ showSDoc $ ppr core
+  putStrLn $ showppr core
 
-js :: FilePath -> IO ()
-js fp = do
+jsStr :: FilePath -> IO (Text,Text)
+jsStr fp = do
   (dynflags,core) <- getCoreAst fp
-  stmt <- runReaderT (runCompile (compileModule core)) dynflags
-  js <- beautify $ Doc.render (ECMA.javaScript (ECMA.Script () stmt))
+  stmts <- runReaderT (runCompile (compileModule core)) dynflags
+  js <- beautify $ T.concat (map renderStatement stmts)
   forejs <- getForeJs
-  writeFile "test.js" (forejs ++ "\n" ++ js ++ run)
-  putStrLn js
+  let str = forejs <> "\n" <> js <> run
+  T.writeFile "test.js" str
+  return (js,str)
+
+js fp = do
+  (js,str) <- jsStr fp
+  T.putStrLn js
 
 ast :: FilePath -> IO ()
 ast fp = do
    (dynflags,core) <- getCoreAst fp
-   stmt <- runReaderT (runCompile (compileModule core)) dynflags
-   print (ECMA.Script () stmt)
+   stmts <- runReaderT (runCompile (compileModule core)) dynflags
+   print stmts
 
-compileFileRun :: FilePath -> IO ()
-compileFileRun fp = do
+interp :: FilePath -> IO ()
+interp fp = do
   (dynflags,core) <- getCoreAst fp
-  stmt <- runReaderT (runCompile $ compileModule core) dynflags
-  js <- beautify $ Doc.render (ECMA.javaScript (ECMA.Script () stmt))
+  stmts <- runReaderT (runCompile $ compileModule core) dynflags
+  js <- beautify $ T.concat (map renderStatement stmts)
   forejs <- getForeJs
-  writeFile "test.js" (forejs ++ "\n" ++ js ++ run)
-  result <- readAllFromProcess "node" ["test.js"] ""
+  let str = forejs <> "\n" <> js <> run
+  interpStr str
+
+interpStr :: Text -> IO ()
+interpStr str = do
+  T.writeFile "/tmp/interp.js" (str)
+  result <- readAllFromProcess "node" ["/tmp/interp.js"] ""
   case result of
-    Left err -> error err
-    Right (stderr,stdout) -> do putStrLn stderr
-                                putStrLn stdout
+    Left err -> error (T.unpack err)
+    Right (stderr,stdout) -> do T.putStrLn stderr
+                                T.putStrLn stdout
 
-run = "_(main$ZCMain$main,true);"
+run :: Text
+run = "var start = new Date();_(main$ZCMain$main,true);var end = new Date();console.log((end-start)+'ms')"
 
+getForeJs :: IO Text
 getForeJs = do
-  rts <- readFile "../js/rts.js"
-  classes <- readFile "../js/classes.js"
-  instances <- readFile "../js/instances.js"
-  io <- readFile "../js/io.js"
-  primitives <- readFile "../js/primitives.js"
-  return (concat [rts,classes,instances,io,primitives])
+  rts <- T.readFile "../js/rts.js"
+  classes <- T.readFile "../js/classes.js"
+  instances <- T.readFile "../js/instances.js"
+  io <- T.readFile "../js/io.js"
+  primitives <- T.readFile "../js/primitives.js"
+  return (T.concat [rts,classes,instances,io,primitives])
 
+--------------------------------------------------------------------------------
+-- Compilers
+
+compileModule :: CoreModule -> Compile [Statement]
 compileModule (CoreModule{cm_binds=binds}) =
-  mapM compileBind binds
+  fmap concat (mapM compileBind binds)
 
+compileBind :: Bind Var -> Compile [Statement]
 compileBind bind =
   case bind of
-    NonRec var exp -> compileNonRec var exp
-    Rec defs -> fmap (VarDeclStmt ()) (mapM compileRec defs)
+    NonRec var exp -> fmap return (compileNonRec var exp)
+    Rec defs -> mapM compileRec defs
 
+compileNonRec :: Var -> Expr Var -> Compile Statement
 compileNonRec var exp = do
   v <- compileVar var
   e <- compileExp exp
-  return (VarDeclStmt () [VarDecl () v (Just (thunk e))])
+  return (Declaration v (thunk e))
 
+compileRec :: (Var, Expr Var) -> Compile Statement
 compileRec (var,exp) = do
   v <- compileVar var
   e <- compileExp exp
-  return (VarDecl () v (Just (thunk e)))
+  return (Declaration v (thunk e))
 
+compileExp :: Expr Var -> Compile Expression
 compileExp exp = (>>= optimizeApp) $
   case exp of
-    Var var -> fmap (VarRef ()) (compileVar var)
+    Var var -> fmap Variable (compileVar var)
     Lit lit -> compileLit lit
     App op arg -> compileApp op arg
     Lam var exp -> compileLam var exp
     Let bind exp -> compileLet bind exp
     Cast exp _ -> compileExp exp
-    Case exp var _ alts -> compileCase exp var alts
-    e -> error $ gshow exp
+    Case exp var typ alts -> compileCase exp var typ alts
 
-compileVar var = compileName (varName var)
+compileVar :: Var -> Compile Identifier
+compileVar var = do
+  let n = getName var
+  -- warn $ showppr n ++ ", loc: " ++ showppr (nameSrcLoc n) ++ ", span: " ++ showppr (nameSrcSpan n)
+  compileName (varName var)
 
-compileName name =
+compileName :: Name -> Compile Identifier
+compileName name = do
   case nameModule_maybe name of
     Just mname -> compileQVar mname name
-    Nothing    -> do
-      -- warn $ "allowing: " ++ getOccString name
-      return (translateName name)
+    Nothing    -> return (translateName name)
 
+compileQVar :: Module -> Name -> Compile Identifier
 compileQVar mod name = do
   when (elem (modulePackageId mod) wiredInPackages &&
         not (elem (printName name) (map printNameParts supported))) $
-    error $ "Unsupported built-in identifier: " ++ printName name ++ " (" ++ encodeName name ++ ")"
+    error $ "Unsupported built-in identifier: " ++
+            T.unpack (printName name) ++
+            " (" ++ T.unpack (encodeName name) ++ ")"
   return (translateName name)
 
+compileLit :: Literal -> Compile Expression
 compileLit lit = return $
   case lit of
-    MachInt i -> IntLit () (fromIntegral i)
-    MachDouble (n :% d) -> NumLit () (fromIntegral n/fromIntegral d)
-    MachFloat (n :% d) -> NumLit () (fromIntegral n/fromIntegral d)
-    MachChar c -> StringLit () [c]
-    MachStr s -> StringLit () (unpackFS s)
+    MachInt i           -> Integer (fromIntegral i)
+    MachDouble (n :% d) -> Double (fromIntegral n/fromIntegral d)
+    MachFloat (n :% d)  -> Double (fromIntegral n/fromIntegral d)
+    MachChar c          -> String [c]
+    MachStr s           -> String (unpackFS s)
 
+compileApp :: Expr Var -> Expr Var -> Compile Expression
 compileApp op arg = do
   case arg of
     Type{} -> compileExp op
@@ -159,83 +317,102 @@ compileApp op arg = do
         _ -> do
           o <- compileExp op
           a <- compileExp arg
-          return (CallExpr () (force o) [a])
+          case o of
+            Apply (Variable ident) [_]
+              | elem ident (map (Identifier . encodeNameParts) methods) -> return (Apply o [a])
+            _ -> return (Apply (force o) [a])
 
+-- | Optimize nested IO actions like a>>b>>c to __(a),__(b),c
 optimizeApp e =
   case e of
-    (CallExpr () (CallExpr () (VarRef () (Id () "__"))
-                 [(CallExpr ()
-                            (CallExpr ()
-                                      (VarRef () (Id () "base$GHC$Base$zgzg"))
-                                      [VarRef () (Id () "base$GHC$Base$zdfMonadIO")])
-                                      [a])])
-                 [b]) -> return $ ListExpr () [act a,b]
+    (Apply (Apply (Variable (Identifier "__"))
+                  [(Apply (Apply (Variable (Identifier "base$GHC$Base$zgzg"))
+                                 [Variable (Identifier "base$GHC$Base$zdfMonadIO")])
+                                 [a])])
+                  [b]) -> return $ Sequence [act a,b]
     e -> return e
 
+compileLam :: Var -> Expr Var -> Compile Expression
 compileLam var exp = do
   v <- compileVar var
   e <- compileExp exp
   return (lambda [v] (thunk e))
 
+compileLet :: Bind Var -> Expr Var -> Compile Expression
 compileLet bind body = do
   case bind of
     NonRec var exp -> compileNonRecLet var exp body
     Rec binds      -> compileRecLet binds body
 
+compileNonRecLet :: Var -> Expr Var -> Expr Var -> Compile Expression
 compileNonRecLet var exp body = do
   v <- compileVar var
   e <- compileExp exp
   b <- compileExp body
-  return (CallExpr () (FuncExpr () Nothing [v] [ReturnStmt () (Just b)])
-                      [e])
+  return (Apply (Function [v] b)
+                [e])
 
+compileRecLet :: [(Var,Expr Var)] -> Expr Var -> Compile Expression
 compileRecLet binds body = do
   b <- compileExp body
-  decls <- fmap (VarDeclStmt ()) (mapM compileVarDecl binds)
-  let closure = FuncExpr () Nothing [] [decls,ReturnStmt () (Just b)]
-  return (CallExpr () closure [])
+  decls <- mapM compileVarDecl binds
+  let closure = Procedure [] (decls ++ [Return b])
+  return (Apply closure [])
 
+compileVarDecl :: (Var,Expr Var) -> Compile Statement
 compileVarDecl (var,exp) = do
   v <- compileVar var
   e <- compileExp exp
-  return (VarDecl () v (Just (thunk e)))
+  return (Declaration v (thunk e))
 
-compileCase exp var alts = do
+compileCase :: Expr Var -> Var -> t -> [(AltCon,[Var],Expr Var)] -> Compile Expression
+compileCase exp var typ alts = do
   e <- compileExp exp
   v <- compileVar var
 
   fmap (bind [v] e)
-       (foldM (matchCon e) (throwExp "unhandled case")
+       (foldM (matchCon (Variable v)) (throwExp "unhandled case")
               -- I have no idea why the DEFAULT case comes first from Core.
               (reverse (filter (not.isDefault) alts ++ filter isDefault alts)))
 
   where isDefault (con,_,_) = con == DEFAULT
 
+matchCon :: Expression -> Expression -> (AltCon,[Var],Expr Var) -> Compile Expression
 matchCon object inner (con,vars,exp) = do
-  error (gshow (object,inner))
   case con of
     DataAlt con -> matchData object inner vars exp con
     LitAlt lit  -> matchLit object inner vars exp lit
     DEFAULT     -> compileExp exp
 
+matchData :: Expression -> Expression -> [Var] -> Expr Var -> DataCon -> Compile Expression
 matchData object inner vars exp con = do
   if printName (dataConName con) == "ghc-prim:GHC.Types.I#"
      then do vs <- mapM compileVar vars
-             fmap (bind vs object) (compileExp exp)
-     else return inner
+             fmap (bind vs (force object)) (compileExp exp)
+     else if printName (dataConName con) == "ghc-prim:GHC.Types.True"
+             then do vs <- mapM compileVar vars
+                     fmap (bind vs (force object)) (compileExp exp)
+             else if printName (dataConName con) == "ghc-prim:GHC.Types.False"
+                     then do vs <- mapM compileVar vars
+                             fmap (bind vs (force object)) (compileExp exp)
+                     else do error ("no-o: " ++ T.unpack (printName (dataConName con)))
+                             return inner
 
+matchLit :: Expression -> Expression -> t -> Expr Var -> Literal -> Compile Expression
 matchLit object inner vars exp lit =
   case lit of
     MachInt i -> do
       e <- compileExp exp
-      return (CondExpr () (InfixExpr () OpStrictEq (force object) (IntLit () (fromIntegral i)))
+      return (Conditional (StrictEqual (Integer (fromIntegral i))
+                                       (object))
                           e
                           inner)
 
-bind vs e = (\i -> CallExpr () (lambda vs i) [e])
+bind :: [Identifier] -> Expression -> Expression -> Expression
+bind vs e = (\i -> Apply (lambda vs i) [e])
 
---------------------------------------------------------------------------------
--- Supported stuff
+-- --------------------------------------------------------------------------------
+-- -- Supported stuff
 
 wiredInPackages =
   [primPackageId
@@ -257,19 +434,20 @@ supported =
 isMethod = flip elem (map encodeNameParts methods)
 
 methods =
-  [("base","System.IO","putStrLn")
-  ,("base","System.IO","print")
+  [("base","System.IO","print")
   ,("base","GHC.Base",">>")
   ,("base","GHC.Show","show")
-  ,("ghc-prim","GHC.Classes","==")
-  ,("ghc-prim","GHC.Classes","<")]
+  -- ,("ghc-prim","GHC.Classes","==")
+  ,("ghc-prim","GHC.Classes","<")
+  ,("base","GHC.Num","+")
+  ,("base","GHC.Num","-")]
 
 rest =
-  [("base","GHC.TopHandler","runMainIO")
+  [("base","System.IO","putStrLn")
+  ,("base","GHC.TopHandler","runMainIO")
   ,("base","GHC.Err","undefined")
   ,("base","GHC.Base","$")
-  ,("base","GHC.Num","+")
-  ,("base","GHC.Num","-")
+  ,("base","Control.Exception.Base","patError") -- TODO:
   -- Primitives
   ,("ghc-prim","GHC.CString","unpackCString#")
   ,("ghc-prim","GHC.Tuple","(,)")
@@ -279,6 +457,7 @@ rest =
   ,("ghc-prim","GHC.Types","I#")
   ,("ghc-prim","GHC.Types","[]")
   ,("ghc-prim","GHC.Classes","$fOrdInt")
+  ,("ghc-prim","GHC.Classes","$fEqInt")
   -- Instances
   ,("base","GHC.Show","$fShow[]")
   ,("base","GHC.Show","$fShowChar")
@@ -289,17 +468,24 @@ rest =
   ,("base","GHC.Base","return")
   ]
 
---------------------------------------------------------------------------------
--- Compiler combinators
+-- --------------------------------------------------------------------------------
+-- -- Compiler combinators
 
-throwExp e = CallExpr () (FuncExpr () Nothing [] [ThrowStmt () (StringLit () e)]) []
+throwExp e = Apply (Procedure [] [Throw (String e)])
+                   []
 
-lambda vs e | map (VarRef ()) vs == [e] = e -- identity
-            | otherwise = FuncExpr () Nothing vs [ReturnStmt () (Just e)]
+lambda :: [Identifier] -> Expression -> Expression
+lambda vs e
+  | map Variable vs == [e] = e
+  | otherwise              = Function vs e
 
-translateName = Id () . encodeName where
+-- | Translate a GHC name to a JS identifier.
+translateName :: Name -> Identifier
+translateName = Identifier . encodeName
 
-encodeName name = encoded where
+-- | Encode a GHC name to an identifier.
+encodeName :: Name -> Text
+encodeName name = T.pack encoded where
   encoded = case nameModule_maybe name of
     Nothing -> zEncodeString (occNameString (nameOccName name))
     Just mod ->
@@ -307,96 +493,139 @@ encodeName name = encoded where
       intercalate "$" (map zEncodeString (words (dotsToSpace (moduleNameString (moduleName mod))))) ++ "$" ++
       zEncodeString (occNameString (nameOccName name))
 
+-- | Convert dots to spaces.
+dotsToSpace :: String -> String
 dotsToSpace = map replace where
   replace '.' = ' '
   replace c   = c
 
+-- | Print a GHC name to some text.
+printName :: Name -> Text
 printName name = printed where
   printed = case nameModule_maybe name of
-    Nothing -> occNameString (nameOccName name)
-    Just mod ->
-      moduleString mod ++ "." ++
-      occNameString (nameOccName name)
+    Nothing -> fastStringToText $ occNameFS (nameOccName name)
+    Just mod -> moduleText mod <> "." <> fastStringToText (occNameFS (nameOccName name))
 
-printNameParts (package,mod,ident) = package ++ ":" ++ mod ++ "." ++ ident
-encodeNameParts (package,mod,ident) =
+-- | Convert a GHC FastString to a Text. There should be a fast way to
+-- convert these.
+fastStringToText :: FastString -> Text
+fastStringToText = T.decodeUtf8 . L.pack . bytesFS
+
+-- | Print the parts of a name to text.
+printNameParts :: (String,String,String) -> Text
+printNameParts (package,mod,ident) = T.pack $
+  package <> ":" <> mod <> "." <> ident
+
+-- | Encode the parts (package, module, identifier) to text.
+encodeNameParts :: (String,String,String) -> Text
+encodeNameParts (package,mod,ident) = T.pack $
   zEncodeString (package) ++ "$" ++
   intercalate "$" (map zEncodeString (words (dotsToSpace mod))) ++ "$" ++
   zEncodeString ident
 
-moduleString mod =
+-- | Print the module name (and package) to text.
+moduleText :: Module -> Text
+moduleText mod = T.pack $
   packageIdString (modulePackageId mod) ++ ":" ++
   moduleNameString (moduleName mod)
 
-warn s = io $ putStrLn $ "Warning: " ++ s
-force e | any ((e==).VarRef () . Id () . encodeNameParts) supported = e
-        | CallExpr () (VarRef () (Id () name)) _ <- e,
-          isMethod name = e
-        | otherwise = CallExpr () (VarRef () (Id () "__")) [e]
+-- | Force an expression, unless it's a built-in function which
+-- doesn't need to be forced.
+force :: Expression -> Expression
+force e
+  -- | Known function name?
+  | any ((e==) . Variable . Identifier . encodeNameParts) supported = e
+  -- | It's a method call on a dictionary, which don't need to be forced.
+  | Apply (Variable (Identifier name)) _ <- e,
+    isMethod name  = e
+  --
+  | otherwise = Apply (Variable (Identifier "__"))
+                      [e]
 
-act e = CallExpr () (VarRef () (Id () "_")) [e]
+-- | Force an IO action.
+act :: Expression -> Expression
+act e = Apply (Variable (Identifier "_"))
+              [e]
 
+-- | Make a thunk for an expression, unless it's a constant or a
+-- function, in which case it's not necessary.
+thunk :: Expression -> Expression
 thunk e =
   if isFunction e
      then e
      else if isConstant e
              then e
-             else NewExpr () (VarRef () (Id () "$"))
-                             [FuncExpr () Nothing []
-                                       [ReturnStmt () (Just e)]]
+             else New (Identifier "$")
+                      (Function [] e)
 
-isConstant IntLit{} = True
-isConstant NumLit{} = True
-isConstant StringLit{} = True
-isConstant VarRef{} = True
-isConstant _       = False
+-- | Is the given expression a constant e.g. a literal or w/e.
+isConstant :: Expression -> Bool
+isConstant Integer{}  = True
+isConstant Double{}   = True
+isConstant String{}   = True
+isConstant Variable{} = True
+isConstant _          = False
 
-isFunction FuncExpr{} = True
+-- | Is the given expression a function?
+isFunction :: Expression -> Bool
+isFunction Function{} = True
 isFunction _          = False
 
 --------------------------------------------------------------------------------
 -- Working with Core
 
 -- | Get the core AST of a Haskell file.
+getCoreAst :: FilePath -> IO (DynFlags,CoreModule)
 getCoreAst fp = do
   defaultErrorHandler defaultLogAction $ do
     runGhc (Just libdir) $ do
       dflags <- getSessionDynFlags
       let dflags' = foldl xopt_set dflags [Opt_Cpp,Opt_ImplicitPrelude,Opt_MagicHash]
-      setSessionDynFlags dflags'
+      setSessionDynFlags dflags' { optLevel = 2 }
       cm <- compileToCoreSimplified fp
       return $ (dflags,cm)
-
--- | Get the ghc -fext-core output of a Haskell file.
-getCoreString :: FilePath -> IO String
-getCoreString fp = do
-  result <- readAllFromProcess "ghc" [fp,"-v0","-fext-core","-O2"] ""
-  case result of
-    Left err -> error err
-    Right (_,_) -> readFile (reverse (dropWhile (/='.') (reverse fp)) ++ "hcr")
 
 --------------------------------------------------------------------------------
 -- Printing
 
--- | Take in JavaScript and output it pretty-printed.
-prettyPrintJS :: String -> String
-prettyPrintJS src =
-  case ECMA.parseScriptFromString "<input>" src of
-    Left e -> error (show e)
-    Right js -> Doc.render (ECMA.javaScript js)
-
-beautify :: String -> IO String
+-- | Beautify the given JS.
+beautify :: Text -> IO Text
 beautify src = do
-  result <- readAllFromProcess "/home/chris/Projects/js-beautify/python/js-beautify" ["-i","-s","2","-d","-w","80"] src
+  result <- readAllFromProcess "/home/chris/Projects/js-beautify/python/js-beautify"
+                               ["-i","-s","2","-d","-w","80"]
+                               src
   case result of
-    Left err -> error err
+    Left err -> error (T.unpack err)
+    Right (_,out) -> return out
+
+-- | Compress the given JS with Closure.
+compress :: Text -> IO Text
+compress src = do
+  result <- readAllFromProcess "java"
+                               ["-jar"
+                               ,"/home/chris/Projects/fpco/learning-site/tools/closure-compiler.jar"]
+                               src
+  case result of
+    Left err -> error (T.unpack err)
+    Right (_,out) -> return out
+
+-- | Compress the given JS with Closure with advanced compilation.
+compressAdv :: Text -> IO Text
+compressAdv src = do
+  result <- readAllFromProcess "java"
+                               ["-jar"
+                               ,"/home/chris/Projects/fpco/learning-site/tools/closure-compiler.jar"
+                               ,"--compilation_level=ADVANCED_OPTIMIZATIONS"]
+                               src
+  case result of
+    Left err -> error (T.unpack err)
     Right (_,out) -> return out
 
 --------------------------------------------------------------------------------
 -- Utilities that should be moved to other modules
 
 -- | Read all stuff from a process.
-readAllFromProcess :: FilePath -> [String] -> String -> IO (Either String (String,String))
+readAllFromProcess :: FilePath -> [String] -> Text -> IO (Either Text (Text,Text))
 readAllFromProcess program flags input = do
   (code,out,err) <- readProcessWithExitCode program flags input
   return $ case code of
@@ -434,8 +663,18 @@ gshows = render `extQ` (shows :: String -> ShowS) where
           isNull = null (filter (not . flip elem "[]") (constructor ""))
           isList = constructor "" == "(:)"
 
+-- | Simple shortcut.
 io :: MonadIO m => IO a -> m a
 io = liftIO
 
-pp :: (MonadIO m,Data a) => a -> m ()
-pp = io . putStrLn . gshow
+-- | Traverse a data type, left to stop, right to keep going after updating the value.
+gtraverseT :: (Data a,Typeable b) => (b -> b) -> a -> a
+gtraverseT f =
+  gmapT (\x -> case cast x of
+                 Nothing -> gtraverseT f x
+                 Just b  -> fromMaybe x (cast (f b)))
+
+-- | Something like Show but for things which annoyingly do not have
+-- Show but Outputable instead.
+showppr :: Outputable a => a -> String
+showppr = showSDoc . ppr
