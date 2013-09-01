@@ -60,10 +60,10 @@ var ghczmprim$GHC$CString$unpackCStringzh = function(xs){
 var ghczmprim$GHC$CString$packCStringzh = function(l){
   return new $(function(){
     var str = "";
-    l = __(l);
+    l = _(l);
     while(l instanceof ghczmprim$Cons) {
       str += l.car;
-      l = __(l.cdr);
+      l = _(l.cdr);
     }
     return str;
   });

@@ -75,9 +75,12 @@ getText stmts = do
   js <- beautify $ renderStatements (length (T.lines forejs)) stmts
   return (forejs <> js <> run)
 
+getText' :: [Statement] -> IO Text
+getText' stmts = do
+  beautify $ renderStatements 0 stmts
+
 interp :: Text -> IO ()
 interp input = do
-  -- T.writeFile "/tmp/interp.js" (str)
   result <- readAllFromProcess "node" [] input
   case result of
     Left err -> error (T.unpack err)
@@ -86,7 +89,7 @@ interp input = do
 
 run :: Text
 run = "var start = new Date();" <>
-      "_(main$ZCMain$main,true);" <>
+      "__(main$ZCMain$main);" <>
       "var end = new Date();" <>
       "console.log((end-start)+'ms')"
 
@@ -188,7 +191,7 @@ compileApp op arg = do
 -- | Optimize nested IO actions like a>>b>>c to __(a),__(b),c
 optimizeApp e =
   case e of
-    (Apply (Apply (Variable (Identifier "__"))
+    (Apply (Apply (Variable (Identifier "_"))
                   [(Apply (Apply (Variable (Identifier "base$GHC$Base$zgzg"))
                                  [Variable (Identifier "base$GHC$Base$zdfMonadIO")])
                                  [a])])
@@ -402,12 +405,12 @@ force e
   | Apply (Variable (Identifier name)) _ <- e,
     isMethod name  = e
   --
-  | otherwise = Apply (Variable (Identifier "__"))
+  | otherwise = Apply (Variable (Identifier "_"))
                       [e]
 
 -- | Force an IO action.
 act :: Expression -> Expression
-act e = Apply (Variable (Identifier "_"))
+act e = Apply (Variable (Identifier "__"))
               [e]
 
 -- | Make a thunk for an expression, unless it's a constant or a

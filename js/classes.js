@@ -41,7 +41,7 @@ var ghczmprim$GHC$Classes$zeze = function(i){
   return function(a){
     return function(b){
       return new $(function(){
-        return __(i(a))(b);
+        return _(i(a))(b);
       });
     }
   }

@@ -4,7 +4,7 @@
 var base$GHC$Base$zd = function(f){
   return function(g){
     return new $(function(){
-      return __(f)(g);
+      return _(f)(g);
     });
   };
 };

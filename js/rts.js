@@ -19,7 +19,7 @@ $.prototype.force = function()
 };
 
 // Force a thunkish thing until WHNF
-function __(thunkish)
+function _(thunkish)
 {
   while (thunkish instanceof $)
     thunkish = thunkish.force();
@@ -27,7 +27,7 @@ function __(thunkish)
 }
 
 // Run a thunk with no updating
-function _(thunkish){
+function __(thunkish){
   while (thunkish instanceof $)
     thunkish = thunkish.value();
   return thunkish;
@@ -38,5 +38,5 @@ function _(thunkish){
 
 // Run the main IO function.
 var base$GHC$TopHandler$runMainIO = function(main){
-  return _(main);
+  return __(main);
 };

@@ -8,10 +8,10 @@ var base$GHC$Show$zdfShowZMZN = function(i){
   return function(l){
     return new $(function(){
       var str = "";
-      l = __(l);
+      l = _(l);
       while(l instanceof ghczmprim$Cons) {
         str += l.car;
-        l = __(l.cdr);
+        l = _(l.cdr);
       }
       return ghczmprim$GHC$CString$unpackCStringzh(str);
     });
@@ -21,14 +21,14 @@ var base$GHC$Show$zdfShowZMZN = function(i){
 // Show Char
 var base$GHC$Show$zdfShowChar = function(x){
   return new $(function(){
-    return ghczmprim$GHC$CString$unpackCStringzh("'" + __(x) + "'");
+    return ghczmprim$GHC$CString$unpackCStringzh("'" + _(x) + "'");
   });
 };
 
 // Show Int
 var base$GHC$Show$zdfShowInt = function(i){
   return new $(function(){
-    return ghczmprim$GHC$CString$unpackCStringzh(__(i).toString());
+    return ghczmprim$GHC$CString$unpackCStringzh(_(i).toString());
   });
 };
 
@@ -51,13 +51,13 @@ var base$GHC$Num$zdfNumInt =
   new base$GHC$Num(function(x){
     return function(y){
       return new $(function(){
-        return __(x) + __(y);
+        return _(x) + _(y);
       });
     };
   },function(x){
     return function(y){
       return new $(function(){
-        return __(x) - __(y);
+        return _(x) - _(y);
       });
     };
   });
@@ -72,7 +72,7 @@ var base$GHC$Base$zdfMonadIO =
   },function(m){
     return function(n){
       return new $(function(){
-        __(m,true);
+        __(m);
         return n;
       });
     }
