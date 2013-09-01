@@ -11,26 +11,26 @@ function $(value)
 }
 
 // Force the thunk object
-$.prototype.force = function(nocache)
+$.prototype.force = function()
 {
-  return nocache ?
-    this.value() :
-    (this.forced ?
-     this.value :
-     (this.value = this.value(), this.forced = true, this.value));
+  return this.forced ?
+    this.value :
+    (this.value = this.value(), this.forced = true, this.value);
 };
 
 // Force a thunkish thing until WHNF
-function __(thunkish,nocache)
+function __(thunkish)
 {
   while (thunkish instanceof $)
-    thunkish = thunkish.force(nocache);
+    thunkish = thunkish.force();
   return thunkish;
 }
 
-// Force a thunk with no thunk updating
+// Run a thunk with no updating
 function _(thunkish){
-  return __(thunkish,true);
+  while (thunkish instanceof $)
+    thunkish = thunkish.value();
+  return thunkish;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -38,5 +38,5 @@ function _(thunkish){
 
 // Run the main IO function.
 var base$GHC$TopHandler$runMainIO = function(main){
-  return __(main,true);
+  return _(main);
 };
