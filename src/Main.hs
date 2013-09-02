@@ -14,6 +14,7 @@
 module Fore where
 
 import           Control.Applicative
+import           Control.Arrow
 import           Control.Exception
 import           Control.Monad
 import           Control.Monad.Identity
@@ -21,6 +22,8 @@ import           Control.Monad.Reader
 import           Control.Monad.State
 import           Control.Monad.Trans
 import           CoreSyn
+import           Data.Aeson (Value)
+import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Lazy as L
 import           Data.Data hiding (tyConName)
 import           Data.Generics.Aliases
@@ -52,6 +55,8 @@ import           Name hiding (varName)
 import           OccName hiding (varName)
 import           Outputable hiding ((<>))
 import           Prelude hiding (exp)
+import qualified SourceMap as SourceMap
+import           SourceMap.Types
 import           System.Exit
 import           System.IO
 import           System.Process.Text.Lazy
@@ -69,15 +74,33 @@ getCore = getCoreAst
 getJs :: CoreModule -> IO [Statement]
 getJs = runCompile . compileModule
 
-getText :: [Statement] -> IO Text
-getText stmts = do
-  forejs <- getForeJs
-  js <- beautify $ renderStatements (length (T.lines forejs)) stmts
-  return (forejs <> js <> run)
+getTextMappings :: Text -> [Statement] -> IO (Text,[Mapping])
+getTextMappings name stmts = do
+  forejs <- getForeJs name
+  let (text,mappings) = renderStatements (length (T.lines forejs)) stmts
+  return (forejs <> text <> run,mappings)
 
-getText' :: [Statement] -> IO Text
-getText' stmts = do
-  beautify $ renderStatements 0 stmts
+getCode :: [Statement] -> IO Text
+getCode stmts = do
+  beautify $ fst $ renderStatements 0 stmts
+
+getMappingsJson :: String -> [Mapping] -> Value
+getMappingsJson name mappings =
+  SourceMap.generate SourceMapping
+    { smFile = name ++ ".js"
+    , smSourceRoot = Nothing
+    , smMappings = mappings
+    }
+
+writeFileMapping :: FilePath -> IO ()
+writeFileMapping fp = do
+  stmts <- getCore fp >>= getJs
+  (text,mappings) <- getTextMappings (T.pack name) stmts
+  print mappings
+  T.writeFile (name ++ ".js") text
+  L.writeFile (name ++ mapExt) (Aeson.encode (getMappingsJson name mappings))
+
+  where name = reverse . dropWhile (=='.') . dropWhile (/='.') . reverse $ fp
 
 interp :: Text -> IO ()
 interp input = do
@@ -93,15 +116,26 @@ run = "var start = new Date();" <>
       "var end = new Date();" <>
       "console.log((end-start)+'ms')"
 
-getForeJs :: IO Text
-getForeJs = do
+getForeJs :: Text -> IO Text
+getForeJs name = do
+  let sourceMapRef = "//@ sourceMappingURL=" <> name <> T.pack mapExt <> "\n"
   rts <- T.readFile "../js/rts.js"
+  base <- T.readFile "../js/base.js"
   classes <- T.readFile "../js/classes.js"
   instances <- T.readFile "../js/instances.js"
   io <- T.readFile "../js/io.js"
   primitives <- T.readFile "../js/primitives.js"
   let header = T.pack (replicate 80 '/') <> "\n// Application/library code\n"
-  beautify (T.concat [rts,classes,instances,io,primitives,header])
+  beautify (T.concat [sourceMapRef
+                     ,rts
+                     ,base
+                     ,classes
+                     ,instances
+                     ,io
+                     ,primitives
+                     ,header])
+
+mapExt = ".json"
 
 --------------------------------------------------------------------------------
 -- Compilers
@@ -124,13 +158,13 @@ compileNonRec :: Var -> Expr Var -> Compile Statement
 compileNonRec var exp = do
   v <- compileVar var
   e <- compileExp exp
-  return (Declaration v (thunk e))
+  return (Declaration v (original (varName var)) (thunk e))
 
 compileRec :: (Var, Expr Var) -> Compile Statement
 compileRec (var,exp) = do
   v <- compileVar var
   e <- compileExp exp
-  return (Declaration v (thunk e))
+  return (Declaration v (original (varName var)) (thunk e))
 
 compileExp :: Expr Var -> Compile Expression
 compileExp exp = (>>= optimizeApp) $
@@ -144,10 +178,7 @@ compileExp exp = (>>= optimizeApp) $
     Case exp var typ alts -> compileCase exp var typ alts
 
 compileVar :: Var -> Compile Identifier
-compileVar var = do
-  let n = getName var
-  -- warn $ showppr n ++ ", loc: " ++ showppr (nameSrcLoc n) ++ ", span: " ++ showppr (nameSrcSpan n)
-  compileName (varName var)
+compileVar var = compileName (varName var)
 
 compileName :: Name -> Compile Identifier
 compileName name = do
@@ -229,7 +260,7 @@ compileVarDecl :: (Var,Expr Var) -> Compile Statement
 compileVarDecl (var,exp) = do
   v <- compileVar var
   e <- compileExp exp
-  return (Declaration v (thunk e))
+  return (Declaration v Nothing (thunk e))
 
 compileCase :: Expr Var -> Var -> t -> [(AltCon,[Var],Expr Var)] -> Compile Expression
 compileCase exp var typ alts = do
@@ -324,6 +355,7 @@ rest =
   ,("ghc-prim","GHC.Types","[]")
   ,("ghc-prim","GHC.Classes","$fOrdInt")
   ,("ghc-prim","GHC.Classes","$fEqInt")
+  ,("base","GHC.Err","error")
   -- Instances
   ,("base","GHC.Show","$fShow[]")
   ,("base","GHC.Show","$fShowChar")
@@ -334,12 +366,22 @@ rest =
   ,("base","GHC.Base","return")
   ]
 
--- --------------------------------------------------------------------------------
--- -- Compiler combinators
+--------------------------------------------------------------------------------
+-- Compiler combinators
 
+-- | Maybe generate an original name/position value.
+original :: Name -> Maybe Original
+original name =
+  case nameSrcLoc name of
+    RealSrcLoc loc -> Just (Original (name,loc))
+    _ -> Nothing
+
+-- | Throw an exception as an expression.
+throwExp :: String -> Expression
 throwExp e = Apply (Procedure [] [Throw (String e)])
                    []
 
+-- | Make a lambda.
 lambda :: [Identifier] -> Expression -> Expression
 lambda vs e
   | map Variable vs == [e] = e
@@ -539,7 +581,7 @@ showppr = showSDoc . ppr
 
 -- | JavaScript statement.
 data Statement
-  = Declaration !Identifier !Expression
+  = Declaration !Identifier !(Maybe Original) !Expression
   | Return !Expression
   | Throw !Expression
   deriving (Eq,Show)
@@ -566,10 +608,18 @@ newtype Identifier
 
 -- | State of the JS printer.
 data PrintState
-  = PrintState { psBuilder :: !Builder
-               , psLine    :: !Int
-               , psColumn  :: !Int
+  = PrintState { psBuilder  :: !Builder
+               , psLine     :: !Int
+               , psColumn   :: !Int
+               , psMappings :: ![Mapping]
                }
+
+-- | Original Haskell name.
+newtype Original = Original (Name,RealSrcLoc)
+  deriving (Eq)
+
+instance Show Original where
+  show (Original name) = showppr name
 
 --------------------------------------------------------------------------------
 -- Pretty printer
@@ -578,23 +628,15 @@ data PrintState
 newtype PP a = PP { runPP :: State PrintState a }
   deriving (Functor,Monad,MonadState PrintState)
 
--- | Write some text to the output builder.
-write :: Text -> PP ()
-write x = do
-  ps <- get
-  let !builder = psBuilder ps <> fromLazyText x
-      !column = psColumn ps + fromIntegral (T.length x)
-  put ps { psBuilder = builder
-         , psColumn = column
-         }
-
 -- | Render the JS AST to text.
-renderStatements :: Int -> [Statement] -> Text
-renderStatements line = write . pp where
+renderStatements :: Int -> [Statement] -> (Text,[Mapping])
+renderStatements line = (write &&& mappings) . pp where
   pp = flip execState state . runPP . ppStatements
   write = toLazyText . psBuilder
-  state = PrintState mempty line 0
+  state = PrintState mempty line 0 []
+  mappings = reverse . psMappings
 
+-- | Pretty print statements.
 ppStatements :: [Statement] -> PP ()
 ppStatements = mapM_ ppStatement
 
@@ -602,12 +644,14 @@ ppStatements = mapM_ ppStatement
 ppStatement :: Statement -> PP ()
 ppStatement s =
   case s of
-    Declaration i e ->
-      do write "var "
+    Declaration i pos e ->
+      do maybe (return ()) (mapping i) pos
+         write "var "
          ppIdentifier i
          write " = "
          ppExpression e
          write ";"
+         newline
     Return e ->
       do write "return ("
          ppExpression e
@@ -670,6 +714,9 @@ ppIdentifier i =
   case i of
     Identifier text -> write text
 
+--------------------------------------------------------------------------------
+-- Utilities for the pretty printer
+
 -- | Intercalate monadic action.
 intercalateM :: Text -> [PP a] -> PP ()
 intercalateM _ [] = return ()
@@ -678,3 +725,52 @@ intercalateM str (x:xs) = do
   x
   write str
   intercalateM str xs
+
+-- | Something to write to the printer builder.
+data Write
+  = WriteNewline
+  | WriteText Text
+
+-- | Write something to the output builder.
+build :: Write -> PP ()
+build x = do
+  ps <- get
+  case x of
+    WriteNewline ->
+      let !column = 0
+          !line = psLine ps + 1
+      in put ps { psBuilder = psBuilder ps <> fromLazyText "\n"
+                , psColumn = column
+                , psLine = line
+                }
+    WriteText text ->
+      let !column = psColumn ps + fromIntegral (T.length text)
+          !builder = psBuilder ps <> fromLazyText text
+      in put ps { psBuilder = builder
+                , psColumn = column
+                }
+
+-- | Write some text to the builder. Shouldn't contain newlines.
+write :: Text -> PP ()
+write = build . WriteText
+
+-- | Write a newline to the output builder.
+newline :: PP ()
+newline = build WriteNewline
+
+-- | Generate a mapping.
+mapping :: Identifier -> Original -> PP ()
+mapping (Identifier identifier) (Original (name,loc)) = modify $ \ps ->
+  ps { psMappings = m ps : psMappings ps
+     }
+
+  where m ps = Mapping { mapGenerated = Pos (fromIntegral (psLine ps))
+                                            (fromIntegral (psColumn ps))
+                       , mapOriginal = Just (Pos (fromIntegral line)
+                                                 (fromIntegral col))
+                       , mapSourceFile = Just (T.unpack (fastStringToText file))
+                       , mapName = Just (T.toStrict (printName name))
+                       }
+        line = srcLocLine loc
+        col = srcLocCol loc
+        file = srcLocFile loc

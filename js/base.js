@@ -16,7 +16,7 @@ var base$GHC$Err$undefined = new $(function(){
 
 // error
 var base$GHC$Err$error = function(s){
-  new $(function(){
-    throw ghczmprim$GHC$CString$packCStringzh(s);
+  return new $(function(){
+    throw "*** Exception: " + _(ghczmprim$GHC$CString$packCStringzh(s));
   });
 };
