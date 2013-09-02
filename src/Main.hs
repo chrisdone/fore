@@ -25,6 +25,7 @@ import           CoreSyn
 import           Data.Aeson (Value)
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString.Lazy as L
+import           Data.Char
 import           Data.Data hiding (tyConName)
 import           Data.Generics.Aliases
 import           Data.List
@@ -77,7 +78,7 @@ getJs = runCompile . compileModule
 getTextMappings :: Text -> [Statement] -> IO (Text,[Mapping])
 getTextMappings name stmts = do
   forejs <- getForeJs name
-  let (text,mappings) = renderStatements (length (T.lines forejs)) stmts
+  let (text,mappings) = renderStatements (length (T.lines forejs) + 1) stmts
   return (forejs <> text <> run,mappings)
 
 getCode :: [Statement] -> IO Text
@@ -96,7 +97,6 @@ writeFileMapping :: FilePath -> IO ()
 writeFileMapping fp = do
   stmts <- getCore fp >>= getJs
   (text,mappings) <- getTextMappings (T.pack name) stmts
-  print mappings
   T.writeFile (name ++ ".js") text
   L.writeFile (name ++ mapExt) (Aeson.encode (getMappingsJson name mappings))
 
@@ -211,6 +211,9 @@ compileApp op arg = do
     _ -> do
       case op of
         Var v | any ((== printName (varName v)) . printNameParts) noops -> compileExp arg
+        (App (Var v') Type{})
+          | printName (varName v') == "base:Control.Exception.Base.patError"
+          , Lit (MachStr fs) <- arg -> compilePatError (fastStringToText fs)
         _ -> do
           o <- compileExp op
           a <- compileExp arg
@@ -218,6 +221,12 @@ compileApp op arg = do
             Apply (Variable ident) [_]
               | elem ident (map (Identifier . encodeNameParts) methods) -> return (Apply o [a])
             _ -> return (Apply (force o) [a])
+
+compilePatError err = return $ throwExp loc ("Non-exhaustive patterns in " <> typ) where
+  loc = Loc (file,line)
+  file = T.takeWhile (/=':') err
+  line = read . T.unpack . T.takeWhile isDigit . T.drop 1 . T.dropWhile (/=':') $ err
+  typ = T.drop 1 . T.dropWhile (/='|') $ err
 
 -- | Optimize nested IO actions like a>>b>>c to __(a),__(b),c
 optimizeApp e =
@@ -268,7 +277,7 @@ compileCase exp var typ alts = do
   v <- compileVar var
 
   fmap (bind [v] e)
-       (foldM (matchCon (Variable v)) (throwExp "unhandled case")
+       (foldM (matchCon (Variable v)) (error "unhandled case")
               -- I have no idea why the DEFAULT case comes first from Core.
               (reverse (filter (not.isDefault) alts ++ filter isDefault alts)))
 
@@ -344,7 +353,6 @@ rest =
   ,("base","GHC.TopHandler","runMainIO")
   ,("base","GHC.Err","undefined")
   ,("base","GHC.Base","$")
-  ,("base","Control.Exception.Base","patError") -- TODO:
   -- Primitives
   ,("ghc-prim","GHC.CString","unpackCString#")
   ,("ghc-prim","GHC.Tuple","(,)")
@@ -377,9 +385,9 @@ original name =
     _ -> Nothing
 
 -- | Throw an exception as an expression.
-throwExp :: String -> Expression
-throwExp e = Apply (Procedure [] [Throw (String e)])
-                   []
+throwExp :: Loc -> Text -> Expression
+throwExp loc e = Apply (Procedure [] [Throw loc (String (T.unpack e))])
+                       []
 
 -- | Make a lambda.
 lambda :: [Identifier] -> Expression -> Expression
@@ -583,7 +591,7 @@ showppr = showSDoc . ppr
 data Statement
   = Declaration !Identifier !(Maybe Original) !Expression
   | Return !Expression
-  | Throw !Expression
+  | Throw !Loc !Expression
   deriving (Eq,Show)
 
 -- | JavaScript expression.
@@ -613,6 +621,10 @@ data PrintState
                , psColumn   :: !Int
                , psMappings :: ![Mapping]
                }
+
+-- | A source location (line,col).
+newtype Loc = Loc (Text,Int)
+  deriving (Show,Eq)
 
 -- | Original Haskell name.
 newtype Original = Original (Name,RealSrcLoc)
@@ -656,8 +668,9 @@ ppStatement s =
       do write "return ("
          ppExpression e
          write ");"
-    Throw e ->
-      do write "throw ("
+    Throw loc e ->
+      do mapFrom loc
+         write "throw ("
          ppExpression e
          write ");"
 
@@ -767,10 +780,24 @@ mapping (Identifier identifier) (Original (name,loc)) = modify $ \ps ->
   where m ps = Mapping { mapGenerated = Pos (fromIntegral (psLine ps))
                                             (fromIntegral (psColumn ps))
                        , mapOriginal = Just (Pos (fromIntegral line)
-                                                 (fromIntegral col))
+                                                 (fromIntegral col - 1))
                        , mapSourceFile = Just (T.unpack (fastStringToText file))
                        , mapName = Just (T.toStrict (printName name))
                        }
         line = srcLocLine loc
         col = srcLocCol loc
         file = srcLocFile loc
+
+-- | Generate a mapping just for a location.
+mapFrom :: Loc -> PP ()
+mapFrom (Loc (file,line)) = modify $ \ps ->
+  ps { psMappings = m ps : psMappings ps
+     }
+
+  where m ps = Mapping { mapGenerated = Pos (fromIntegral (psLine ps))
+                                            (fromIntegral (psColumn ps))
+                       , mapOriginal = Just (Pos (fromIntegral line)
+                                                 0)
+                       , mapSourceFile = Just (T.unpack file)
+                       , mapName = Nothing
+                       }
