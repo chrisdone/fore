@@ -73,7 +73,7 @@ getCore :: FilePath -> IO CoreModule
 getCore = getCoreAst
 
 getJs :: CoreModule -> IO [Statement]
-getJs = runCompile . compileModule
+getJs = flip runReaderT Nothing . runCompile . compileModule
 
 getTextMappings :: Text -> [Statement] -> IO (Text,[Mapping])
 getTextMappings name stmts = do
@@ -141,8 +141,8 @@ mapExt = ".json"
 -- Compilers
 
 -- | The compilation monad.
-newtype Compile a = Compile { runCompile :: IO a }
-  deriving (Monad,Functor,MonadIO,Applicative)
+newtype Compile a = Compile { runCompile :: ReaderT (Maybe Original) IO a }
+  deriving (Monad,Functor,MonadIO,Applicative,MonadReader (Maybe Original))
 
 compileModule :: CoreModule -> Compile [Statement]
 compileModule (CoreModule{cm_binds=binds}) =
@@ -151,20 +151,17 @@ compileModule (CoreModule{cm_binds=binds}) =
 compileBind :: Bind Var -> Compile [Statement]
 compileBind bind =
   case bind of
-    NonRec var exp -> fmap return (compileNonRec var exp)
-    Rec defs -> mapM compileRec defs
+    NonRec var exp -> fmap return (compileGeneralBind var exp)
+    Rec defs -> mapM (uncurry compileGeneralBind) defs
 
-compileNonRec :: Var -> Expr Var -> Compile Statement
-compileNonRec var exp = do
+compileGeneralBind :: Var -> Expr Var -> Compile Statement
+compileGeneralBind var exp = do
   v <- compileVar var
-  e <- compileExp exp
-  return (Declaration v (original (varName var)) (thunk e))
+  e <- local (const orig)
+             (compileExp exp)
+  return (Declaration v orig (thunk e))
 
-compileRec :: (Var, Expr Var) -> Compile Statement
-compileRec (var,exp) = do
-  v <- compileVar var
-  e <- compileExp exp
-  return (Declaration v (original (varName var)) (thunk e))
+  where orig = original (varName var)
 
 compileExp :: Expr Var -> Compile Expression
 compileExp exp = (>>= optimizeApp) $
@@ -214,6 +211,7 @@ compileApp op arg = do
         (App (Var v') Type{})
           | printName (varName v') == "base:Control.Exception.Base.patError"
           , Lit (MachStr fs) <- arg -> compilePatError (fastStringToText fs)
+          | printName (varName v') == "base:GHC.Err.error" -> compileUserError arg
         _ -> do
           o <- compileExp op
           a <- compileExp arg
@@ -222,11 +220,22 @@ compileApp op arg = do
               | elem ident (map (Identifier . encodeNameParts) methods) -> return (Apply o [a])
             _ -> return (Apply (force o) [a])
 
-compilePatError err = return $ throwExp loc ("Non-exhaustive patterns in " <> typ) where
-  loc = Loc (file,line)
-  file = T.takeWhile (/=':') err
-  line = read . T.unpack . T.takeWhile isDigit . T.drop 1 . T.dropWhile (/=':') $ err
-  typ = T.drop 1 . T.dropWhile (/='|') $ err
+compilePatError err =
+  return $ throwExp loc (String (T.unpack ("Non-exhaustive patterns in " <> typ)))
+
+    where
+      loc = Loc (file,line)
+      file = T.takeWhile (/=':') err
+      line = read . T.unpack . T.takeWhile isDigit . T.drop 1 . T.dropWhile (/=':') $ err
+      typ = T.drop 1 . T.dropWhile (/='|') $ err
+
+compileUserError err = do
+  e <- compileExp err
+  decl <- ask
+  let line = maybe 0 (srcLocLine . snd . unOriginal) decl
+  return $ throwExp (Loc ("X.hs",line))
+                    (force (Apply (Variable (Identifier "ghczmprim$GHC$CString$packCStringzh"))
+                                  [e]))
 
 -- | Optimize nested IO actions like a>>b>>c to __(a),__(b),c
 optimizeApp e =
@@ -355,6 +364,7 @@ rest =
   ,("base","GHC.Base","$")
   -- Primitives
   ,("ghc-prim","GHC.CString","unpackCString#")
+  ,("ghc-prim","GHC.CString","packCString#")
   ,("ghc-prim","GHC.Tuple","(,)")
   ,("ghc-prim","GHC.Tuple","()")
   ,("ghc-prim","GHC.Types",":")
@@ -363,7 +373,6 @@ rest =
   ,("ghc-prim","GHC.Types","[]")
   ,("ghc-prim","GHC.Classes","$fOrdInt")
   ,("ghc-prim","GHC.Classes","$fEqInt")
-  ,("base","GHC.Err","error")
   -- Instances
   ,("base","GHC.Show","$fShow[]")
   ,("base","GHC.Show","$fShowChar")
@@ -385,8 +394,8 @@ original name =
     _ -> Nothing
 
 -- | Throw an exception as an expression.
-throwExp :: Loc -> Text -> Expression
-throwExp loc e = Apply (Procedure [] [Throw loc (String (T.unpack e))])
+throwExp :: Loc -> Expression -> Expression
+throwExp loc e = Apply (Procedure [] [Throw loc e])
                        []
 
 -- | Make a lambda.
@@ -627,7 +636,7 @@ newtype Loc = Loc (Text,Int)
   deriving (Show,Eq)
 
 -- | Original Haskell name.
-newtype Original = Original (Name,RealSrcLoc)
+newtype Original = Original { unOriginal :: (Name,RealSrcLoc) }
   deriving (Eq)
 
 instance Show Original where
